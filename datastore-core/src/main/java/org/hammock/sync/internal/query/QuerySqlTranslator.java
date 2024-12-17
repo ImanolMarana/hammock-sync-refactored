@@ -178,13 +178,33 @@ class QuerySqlTranslator {
             root = new OrQueryNode();
         }
 
-        // Compile a list of simple clauses to be handled below.  If a text clause is
+        // Compile a list of simple clauses to be handled below. If a text clause is
         // encountered, store it separately from the simple clauses since it will be
         // handled later on its own.
-        List<Object> basicClauses = null;
-        Object textClause = null;
+        List<Object> basicClauses = extractBasicClauses(clauses);
+        Object textClause = extractTextClause(clauses);
 
-        for (Object rawClause: clauses) {
+        // Handle the simple "field": { "$operator": "value" } clauses.
+        root = handleBasicClauses(query, indexes, state, root, basicClauses);
+
+        // A text clause such as { "$text" : { "$search" : "foo bar baz" } }
+        // by nature uses its own text index. It is therefor handled
+        // separately from other simple clauses.
+        root = handleTextClause(indexes, state, root, textClause);
+
+        // AND and OR subclauses are handled identically whatever the parent is.
+        // We go through the query twice to order the OR clauses before the AND
+        // clauses, for predictability.
+
+        root = addSubclauses(clauses, indexes, state, root, OR);
+        root = addSubclauses(clauses, indexes, state, root, AND);
+
+        return root;
+    }
+
+    private static List<Object> extractBasicClauses(List<Object> clauses) {
+        List<Object> basicClauses = null;
+        for (Object rawClause : clauses) {
             Map<String, Object> clause = (Map<String, Object>) rawClause;
             String field = (String) clause.keySet().toArray()[0];
             if (!field.startsWith("$")) {
@@ -192,80 +212,99 @@ class QuerySqlTranslator {
                     basicClauses = new ArrayList<Object>();
                 }
                 basicClauses.add(rawClause);
-            } else if (field.equalsIgnoreCase(TEXT)) {
+            }
+        }
+        return basicClauses;
+    }
+
+    private static Object extractTextClause(List<Object> clauses) {
+        Object textClause = null;
+        for (Object rawClause : clauses) {
+            Map<String, Object> clause = (Map<String, Object>) rawClause;
+            String field = (String) clause.keySet().toArray()[0];
+            if (field.equalsIgnoreCase(TEXT)) {
                 textClause = rawClause;
             }
         }
+        return textClause;
+    }
 
-        // Handle the simple "field": { "$operator": "value" } clauses. These are
-        // handled differently for AND and OR parents, so we need to have the conditional
-        // logic below.
+    private static ChildrenQueryNode handleBasicClauses(Map<String, Object> query, List<Index> indexes, TranslatorState state, ChildrenQueryNode root, List<Object> basicClauses) {
         if (basicClauses != null) {
             if (query.get(AND) != null) {
-                // For an AND query, we require a single compound index and we generate a
-                // single SQL statement to use that index to satisfy the clauses.
-
-                String chosenIndex = chooseIndexForAndClause(basicClauses, indexes);
-                if (chosenIndex == null || chosenIndex.isEmpty()) {
-                    state.atLeastOneIndexMissing = true;
-                    String msg = String.format("No single index contains all of %s; %s",
-                            basicClauses.toString(),
-                            "add index for these fields to query efficiently.");
-                    logger.log(Level.WARNING, msg);
-                } else {
-                    state.atLeastOneIndexUsed = true;
-
-                    // Execute SQL on that index with appropriate values
-                    SqlParts select = selectStatementForAndClause(basicClauses, chosenIndex);
-
-                    SqlQueryNode sqlNode = new SqlQueryNode();
-                    sqlNode.sql = select;
-
-                    if (root != null) {
-                        root.children.add(sqlNode);
-                    }
-                }
+                root = handleAndBasicClauses(indexes, state, root, basicClauses);
             } else if (query.get(OR) != null) {
-                // OR nodes require a query for each clause.
-                //
-                // We want to allow OR clauses to use separate indexes, unlike for AND, to allow
-                // users to query over multiple indexes during a single query. This prevents users
-                // having to create a single huge index just because one query in their application
-                // requires it, slowing execution of all the other queries down.
-                //
-                // We could optimise for OR parts where we have an appropriate compound index,
-                // but we don't for now.
+                root = handleOrBasicClauses(indexes, state, root, basicClauses);
+            }
+        }
+        return root;
+    }
 
-                for (Object basicClause : basicClauses) {
-                    List<Object> wrappedClause = Arrays.asList(basicClause);
-                    String chosenIndex = chooseIndexForAndClause(wrappedClause, indexes);
-                    if (chosenIndex == null || chosenIndex.isEmpty()) {
-                        state.atLeastOneIndexMissing = true;
-                        state.atLeastOneORIndexMissing = true;
-                        String msg = String.format("No single index contains all of %s; %s",
-                                basicClauses.toString(),
-                                "add index for these fields to query efficiently.");
-                        logger.log(Level.WARNING, msg);
-                    } else {
-                        state.atLeastOneIndexUsed = true;
+    private static ChildrenQueryNode handleAndBasicClauses(List<Index> indexes, TranslatorState state, ChildrenQueryNode root, List<Object> basicClauses) {
+        // For an AND query, we require a single compound index and we generate a
+        // single SQL statement to use that index to satisfy the clauses.
+        String chosenIndex = chooseIndexForAndClause(basicClauses, indexes);
+        if (chosenIndex == null || chosenIndex.isEmpty()) {
+            state.atLeastOneIndexMissing = true;
+            String msg = String.format("No single index contains all of %s; %s",
+                    basicClauses.toString(),
+                    "add index for these fields to query efficiently.");
+            logger.log(Level.WARNING, msg);
+        } else {
+            state.atLeastOneIndexUsed = true;
 
-                        // Execute SQL on that index with appropriate values
-                        SqlParts select = selectStatementForAndClause(wrappedClause, chosenIndex);
+            // Execute SQL on that index with appropriate values
+            SqlParts select = selectStatementForAndClause(basicClauses, chosenIndex);
 
-                        SqlQueryNode sqlNode = new SqlQueryNode();
-                        sqlNode.sql = select;
+            SqlQueryNode sqlNode = new SqlQueryNode();
+            sqlNode.sql = select;
 
-                        if (root != null) {
-                            root.children.add(sqlNode);
-                        }
-                    }
+            if (root != null) {
+                root.children.add(sqlNode);
+            }
+        }
+        return root;
+    }
+
+    private static ChildrenQueryNode handleOrBasicClauses(List<Index> indexes, TranslatorState state, ChildrenQueryNode root, List<Object> basicClauses) {
+        // OR nodes require a query for each clause.
+        //
+        // We want to allow OR clauses to use separate indexes, unlike for AND, to allow
+        // users to query over multiple indexes during a single query. This prevents users
+        // having to create a single huge index just because one query in their application
+        // requires it, slowing execution of all the other queries down.
+        //
+        // We could optimise for OR parts where we have an appropriate compound index,
+        // but we don't for now.
+
+        for (Object basicClause : basicClauses) {
+            List<Object> wrappedClause = Arrays.asList(basicClause);
+            String chosenIndex = chooseIndexForAndClause(wrappedClause, indexes);
+            if (chosenIndex == null || chosenIndex.isEmpty()) {
+                state.atLeastOneIndexMissing = true;
+                state.atLeastOneORIndexMissing = true;
+                String msg = String.format("No single index contains all of %s; %s",
+                        basicClauses.toString(),
+                        "add index for these fields to query efficiently.");
+                logger.log(Level.WARNING, msg);
+            } else {
+                state.atLeastOneIndexUsed = true;
+
+                // Execute SQL on that index with appropriate values
+                SqlParts select = selectStatementForAndClause(wrappedClause, chosenIndex);
+
+                SqlQueryNode sqlNode = new SqlQueryNode();
+                sqlNode.sql = select;
+
+                if (root != null) {
+                    root.children.add(sqlNode);
                 }
             }
         }
+        return root;
+    }
 
-        // A text clause such as { "$text" : { "$search" : "foo bar baz" } }
-        // by nature uses its own text index.  It is therefor handled
-        // separately from other simple clauses.
+    private static ChildrenQueryNode handleTextClause(List<Index> indexes, TranslatorState state, ChildrenQueryNode root, Object textClause) {
         if (textClause != null) {
             state.textIndexRequired = true;
             String textIndex = getTextIndex(indexes);
@@ -282,40 +321,23 @@ class QuerySqlTranslator {
                 }
             }
         }
-
-        //
-        // AND and OR subclauses are handled identically whatever the parent is.
-        // We go through the query twice to order the OR clauses before the AND
-        // clauses, for predictability.
-        //
-
-        // Add subclauses that are OR
-        for (Object rawClause: clauses) {
-            Map<String, Object> clause = (Map<String, Object>) rawClause;
-            String field = (String) clause.keySet().toArray()[0];
-            if (field.equals(OR)) {
-                QueryNode orNode = translateQuery(clause, indexes, state);
-                if (root != null) {
-                    root.children.add(orNode);
-                }
-            }
-        }
-
-        // Add subclauses that are AND
-        for (Object rawClause: clauses) {
-            Map<String, Object> clause = (Map<String, Object>) rawClause;
-            String field = (String) clause.keySet().toArray()[0];
-            if (field.equals(AND)) {
-                QueryNode andNode = translateQuery(clause, indexes, state);
-                if (root != null) {
-                    root.children.add(andNode);
-                }
-            }
-        }
-
         return root;
     }
 
+    private static ChildrenQueryNode addSubclauses(List<Object> clauses, List<Index> indexes, TranslatorState state, ChildrenQueryNode root, String clauseType) {
+        for (Object rawClause : clauses) {
+            Map<String, Object> clause = (Map<String, Object>) rawClause;
+            String field = (String) clause.keySet().toArray()[0];
+            if (field.equals(clauseType)) {
+                QueryNode subNode = translateQuery(clause, indexes, state);
+                if (root != null) {
+                    root.children.add(subNode);
+                }
+            }
+        }
+        return root;
+    }
+    
     private static List<String> fieldsForAndClause(List<Object> clause) {
         Misc.checkNotNull(clause, "clause");
 
@@ -335,11 +357,20 @@ class QuerySqlTranslator {
      * Checks for the existence of an operator in a query clause list
      */
     protected static boolean isOperatorFoundInClause(String operator, List<Object> clause) {
-        boolean found = false;
-
         // first check for the existence of $not so that we can find negated operators:
         // if we find $not then recurse with the value associated with it in the query map
-        for (Object rawTerm : clause){
+        boolean found = isOperatorFoundInClauseWithNot(operator, clause);
+
+        // if we didn't find $not then look directly for the operator
+        if (!found) {
+            found = isOperatorFoundDirectly(operator, clause);
+        }
+
+        return found;
+    }
+
+    private static boolean isOperatorFoundInClauseWithNot(String operator, List<Object> clause) {
+        for (Object rawTerm : clause) {
             if (rawTerm instanceof Map) {
                 Map term = (Map) rawTerm;
                 if (term.size() == 1 && term.values().toArray()[0] instanceof Map) {
@@ -351,22 +382,22 @@ class QuerySqlTranslator {
                 }
             }
         }
+        return false;
+    }
 
-        // if we didn't find $not then look directly for the operator
-        for (Object rawTerm : clause){
+    private static boolean isOperatorFoundDirectly(String operator, List<Object> clause) {
+        for (Object rawTerm : clause) {
             if (rawTerm instanceof Map) {
                 Map term = (Map) rawTerm;
                 if (term.size() == 1 && term.values().toArray()[0] instanceof Map) {
                     Map predicate = (Map) term.values().toArray()[0];
                     if (predicate.get(operator) != null) {
-                        found = true;
-                        break;
+                        return true;
                     }
                 }
             }
         }
-
-        return found;
+        return false;
     }
 
     protected static String chooseIndexForAndClause(List<Object> clause,
