@@ -80,82 +80,69 @@ public class Replay429Interceptor implements HttpConnectionResponseInterceptor {
     @Override
     public HttpConnectionInterceptorContext interceptResponse(HttpConnectionInterceptorContext
                                                                       context) {
-
-        // Get or init the stored context for this interceptor
-
         try {
             HttpURLConnection urlConnection = context.connection.getConnection();
             int code = urlConnection.getResponseCode();
-
-            // We only want to take action on a 429 response
+    
             if (code != 429) {
                 return context;
             }
-
-            // We received a 429
-
-            // Get the counter from the request context state
-            AtomicInteger attemptCounter = context.getState(this, ATTEMPT, AtomicInteger.class);
-
-            // If there was no counter yet, then this is the first 429 received for this request
-            if (attemptCounter == null) {
-                context.setState(this, ATTEMPT, (attemptCounter = new AtomicInteger()));
-            }
-
-            // Get the current value, and then increment for the next time round
-            int attempt = attemptCounter.getAndIncrement();
-
-            // Check if we have remaining replays
-            if (attempt < numberOfReplays && context.connection.getNumberOfRetriesRemaining() > 0) {
-
-                // Calculate the backoff time, 2^n * initial sleep
-                long sleepTime = initialSleep * Math.round(Math.pow(2, attempt));
-
-                // If the response includes a Retry-After then that is when we will retry, otherwise
-                // we use the doubling sleep
-                String retryAfter = preferRetryAfter ? urlConnection.getHeaderField
-                        ("Retry-After") : null;
-                if (retryAfter != null) {
-                    // See https://tools.ietf.org/html/rfc6585#section-4
-                    // Whilst not specified for 429 for 3xx or 503 responses the Retry-After header
-                    // is expressed as an integer number of seconds or a date in one of the 3 HTTP
-                    // date formats https://www.w3.org/Protocols/rfc2616/rfc2616-sec3.html#sec3.3
-                    // Cloudant servers should give us an integer number of seconds, so don't worry
-                    // about parsing dates for now.
-                    try {
-                        sleepTime = Long.parseLong(retryAfter) * 1000;
-                        if (sleepTime > RETRY_AFTER_CAP) {
-                            sleepTime = RETRY_AFTER_CAP;
-                            logger.severe("Server specified Retry-After value in excess of one " +
-                                    "hour, capping retry.");
-                        }
-                    } catch (NumberFormatException nfe) {
-                        logger.warning("Invalid Retry-After value from server falling back to " +
-                                "default backoff.");
-                    }
-                }
-                // Read the reasons and log a warning
-                String errorString = Utils.collectAndCloseStream(urlConnection.getErrorStream());
-                logger.warning(errorString + " will retry in " + sleepTime + " ms");
-                logger.fine("Too many requests backing off for " + sleepTime + " ms.");
-
-                // Sleep the thread for the appropriate backoff time
-                try {
-                    TimeUnit.MILLISECONDS.sleep(sleepTime);
-                } catch (InterruptedException e) {
-                    logger.fine("Interrupted during 429 backoff wait.");
-                    // If the thread was interrupted we'll just continue and try again a bit earlier
-                    // than planned.
-                }
-
-                // Get ready to replay the request after the backoff time
-                context.replayRequest = true;
-                return context;
-            } else {
-                return context;
-            }
+    
+            return handle429Response(context, urlConnection);
+    
         } catch (IOException e) {
             throw new HttpConnectionInterceptorException(e);
+        }
+    }
+    
+    private HttpConnectionInterceptorContext handle429Response(HttpConnectionInterceptorContext context, HttpURLConnection urlConnection) throws IOException {
+        AtomicInteger attemptCounter = context.getState(this, ATTEMPT, AtomicInteger.class);
+    
+        if (attemptCounter == null) {
+            context.setState(this, ATTEMPT, (attemptCounter = new AtomicInteger()));
+        }
+    
+        int attempt = attemptCounter.getAndIncrement();
+    
+        if (attempt < numberOfReplays && context.connection.getNumberOfRetriesRemaining() > 0) {
+            long sleepTime = calculateSleepTime(urlConnection, attempt);
+    
+            String errorString = Utils.collectAndCloseStream(urlConnection.getErrorStream());
+            logger.warning(errorString + " will retry in " + sleepTime + " ms");
+            logger.fine("Too many requests backing off for " + sleepTime + " ms.");
+    
+            sleepThread(sleepTime);
+    
+            context.replayRequest = true;
+            return context;
+        } else {
+            return context;
+        }
+    }
+    
+    private long calculateSleepTime(HttpURLConnection urlConnection, int attempt) {
+        long sleepTime = initialSleep * Math.round(Math.pow(2, attempt));
+    
+        String retryAfter = preferRetryAfter ? urlConnection.getHeaderField("Retry-After") : null;
+        if (retryAfter != null) {
+            try {
+                sleepTime = Long.parseLong(retryAfter) * 1000;
+                if (sleepTime > RETRY_AFTER_CAP) {
+                    sleepTime = RETRY_AFTER_CAP;
+                    logger.severe("Server specified Retry-After value in excess of one hour, capping retry.");
+                }
+            } catch (NumberFormatException nfe) {
+                logger.warning("Invalid Retry-After value from server falling back to default backoff.");
+            }
+        }
+        return sleepTime;
+    }
+    
+    private void sleepThread(long sleepTime) {
+        try {
+            TimeUnit.MILLISECONDS.sleep(sleepTime);
+        } catch (InterruptedException e) {
+            logger.fine("Interrupted during 429 backoff wait.");
         }
     }
 }
