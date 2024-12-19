@@ -71,6 +71,17 @@ class IndexCreator {
      */
     private Index ensureIndexed(Index proposedIndex) throws QueryException {
 
+        validateFieldSort(proposedIndex);
+        validateIndexType(proposedIndex);
+    
+        List<FieldSort> fieldNamesList = prepareFieldNames(proposedIndex.fieldNames);
+        proposedIndex = generateIndexNameIfNeeded(proposedIndex);
+    
+        List<Index> existingIndexes = getExistingIndexes();
+        return checkExistingIndexesAndCreate(proposedIndex, fieldNamesList, existingIndexes);
+    }
+    
+    private void validateFieldSort(Index proposedIndex) {
         for (FieldSort fs : proposedIndex.fieldNames) {
             if (fs.sort == FieldSort.Direction.DESCENDING) {
                 throw new UnsupportedOperationException("Indexes with Direction.DESCENDING are " +
@@ -79,48 +90,43 @@ class IndexCreator {
                         "Direction.DESCENDING fields as required.");
             }
         }
-
-        if (proposedIndex.indexType == IndexType.TEXT) {
-            if (!SQLDatabaseFactory.FTS_AVAILABLE) {
-                String message = "Text search not supported.  To add support for text " +
-                        "search, enable FTS compile options in SQLite.";
-                logger.log(Level.SEVERE, message);
-                throw new QueryException(message);
-            }
+    }
+    
+    private void validateIndexType(Index proposedIndex) throws QueryException {
+        if (proposedIndex.indexType == IndexType.TEXT && !SQLDatabaseFactory.FTS_AVAILABLE) {
+            String message = "Text search not supported.  To add support for text " +
+                    "search, enable FTS compile options in SQLite.";
+            logger.log(Level.SEVERE, message);
+            throw new QueryException(message);
         }
-
-        final List<FieldSort> fieldNamesList = proposedIndex.fieldNames;
-
+    }
+    
+    private List<FieldSort> prepareFieldNames(List<FieldSort> fieldNamesList) {
         Set<String> uniqueNames = new HashSet<String>();
-        for (FieldSort fieldName: fieldNamesList) {
+        for (FieldSort fieldName : fieldNamesList) {
             uniqueNames.add(fieldName.field);
-            Misc.checkArgument(validFieldName(fieldName.field), "Field "+fieldName.field+" is not valid");
+            Misc.checkArgument(validFieldName(fieldName.field), "Field " + fieldName.field + " is not valid");
         }
-
+    
         // Check there are no duplicate field names in the array
         Misc.checkArgument(uniqueNames.size() == fieldNamesList.size(), String.format("Cannot create index with duplicated field names %s"
-                , proposedIndex.fieldNames));
-
-        // Prepend _id and _rev if it's not in the array
+                , fieldNamesList));
+    
+    
         if (!uniqueNames.contains("_rev")) {
             fieldNamesList.add(0, new FieldSort("_rev"));
         }
-
+    
         if (!uniqueNames.contains("_id")) {
             fieldNamesList.add(0, new FieldSort("_id"));
         }
-
-        // get existing indexes
-        List<Index> existingIndexes;
-        try {
-            existingIndexes = DatabaseImpl.get(this.queue.submit(new ListIndexesCallable()));
-        } catch (ExecutionException e) {
-            String msg = "Failed to list indexes";
-            logger.log(Level.SEVERE, msg, e);
-            throw new QueryException(msg, e);
-        }
-
-        if(proposedIndex.indexName == null){
+        return fieldNamesList;
+    }
+    
+    
+    
+    private Index generateIndexNameIfNeeded(Index proposedIndex) {
+        if (proposedIndex.indexName == null) {
             // generate a name for the index.
             String indexName = GENERATED_INDEX_NAME_PREFIX + proposedIndex.toString();
             // copy over definition of existing proposed index and create it with this name
@@ -129,69 +135,72 @@ class IndexCreator {
                     proposedIndex.indexType,
                     proposedIndex.tokenizer);
         }
-
+        return proposedIndex;
+    }
+    
+    
+    private List<Index> getExistingIndexes() throws QueryException {
+        try {
+            return DatabaseImpl.get(this.queue.submit(new ListIndexesCallable()));
+        } catch (ExecutionException e) {
+            String msg = "Failed to list indexes";
+            logger.log(Level.SEVERE, msg, e);
+            throw new QueryException(msg, e);
+        }
+    }
+    
+    private Index checkExistingIndexesAndCreate(Index proposedIndex, List<FieldSort> fieldNamesList, List<Index> existingIndexes) throws QueryException {
         for (Index existingIndex : existingIndexes) {
-
-            // Check the index limit.  Limit is 1 for "text" indexes and unlimited for "json" indexes.
-            // If there are any existing "text" indexes, throw an exception
-            if (proposedIndex.indexType == IndexType.TEXT &&
-                    existingIndex.indexType == IndexType.TEXT) {
+            if (proposedIndex.indexType == IndexType.TEXT && existingIndex.indexType == IndexType.TEXT) {
                 String msg = String.format("Text index limit reached. There is a limit of one " +
-                        "text index per database. There is an existing text index in this " +
-                        "database called \"%s\".",
+                                "text index per database. There is an existing text index in this " +
+                                "database called \"%s\".",
                         existingIndex.indexName);
                 logger.log(Level.SEVERE, msg, existingIndex.indexName);
                 throw new QueryException(msg);
             }
-
-            //
-            // check if an index of this name already exists
-            //
+    
             if (existingIndex.indexName.equals(proposedIndex.indexName)) {
-                if (existingIndex.equals(proposedIndex)) {
-                    // we already have an index with this name and the same definition, just update
-                    // it and return it
-                    logger.fine(String.format("Index with name \"%s\" already exists with same " +
-                            "definition", proposedIndex.indexName));
-
-                    IndexUpdater.updateIndex(existingIndex.indexName,
-                            existingIndex.fieldNames,
-                            database,
-                            queue);
-                    return existingIndex;
-                } else {
-                    throw new QueryException(String.format("Index with name \"%s\" already exists" +
-                            " but has different definition to requested index", proposedIndex
-                            .indexName));
-                }
+                return handleExistingIndexSameName(proposedIndex, existingIndex, fieldNamesList);
+    
             }
-            //
-            // check if an index already exists that matches the request index definition, ignoring name
-            //
-            // construct an index for comparison which has the same values as the proposed index
-            // but the name of the one we're comparing to
-            Index compare = new Index(proposedIndex.fieldNames, existingIndex.indexName, proposedIndex
-                    .indexType, proposedIndex.tokenizer);
+    
+            Index compare = new Index(proposedIndex.fieldNames, existingIndex.indexName, proposedIndex.indexType, proposedIndex.tokenizer);
             if (compare.equals(existingIndex)) {
-                // we already have an index with the same definition but a different name, just
-                // update it and return it
-                logger.fine(String.format("Index with name \"%s\" exists which has same " +
-                        "definition of requested index \"%s\"",
-                        existingIndex.indexName, proposedIndex.indexName));
-
-                IndexUpdater.updateIndex(existingIndex.indexName,
-                        existingIndex.fieldNames,
-                        database,
-                        queue);
-                return existingIndex;
+                 return handleExistingIndexSameDefinition(existingIndex, fieldNamesList);
             }
         }
-
-        final Index index = proposedIndex;
-
+    
+        return createNewIndex(proposedIndex, fieldNamesList);
+    }
+    
+    
+    private Index handleExistingIndexSameName(Index proposedIndex, Index existingIndex, List<FieldSort> fieldNamesList) throws QueryException {
+        if (existingIndex.equals(proposedIndex)) {
+            logger.fine(String.format("Index with name \"%s\" already exists with same " +
+                    "definition", proposedIndex.indexName));
+    
+            IndexUpdater.updateIndex(existingIndex.indexName, fieldNamesList, database, queue);
+            return existingIndex;
+        } else {
+            throw new QueryException(String.format("Index with name \"%s\" already exists" +
+                    " but has different definition to requested index", proposedIndex.indexName));
+        }
+    }
+    
+    
+    private Index handleExistingIndexSameDefinition(Index existingIndex, List<FieldSort> fieldNamesList) throws QueryException{
+            logger.fine(String.format("Index with name \"%s\" exists which has same " +
+                    "definition of requested index \"%s\"",
+                    existingIndex.indexName));
+    
+            IndexUpdater.updateIndex(existingIndex.indexName, fieldNamesList, database, queue);
+            return existingIndex;
+    }
+    
+    private Index createNewIndex(Index index, List<FieldSort> fieldNamesList) throws QueryException {
         Future<Void> result = queue.submitTransaction(new CreateIndexCallable(fieldNamesList, index));
-
-        // Update the new index if it's been created
+    
         try {
             result.get();
         } catch (ExecutionException e) {
@@ -203,16 +212,11 @@ class IndexCreator {
             logger.log(Level.SEVERE, message, e);
             throw new QueryException(message, e);
         }
-
-        IndexUpdater.updateIndex(index.indexName,
-                fieldNamesList,
-                database,
-                queue);
-
+    
+        IndexUpdater.updateIndex(index.indexName, fieldNamesList, database, queue);
         return index;
-
+    
     }
-
     /**
      *  Validate the field name string is usable.
      *
